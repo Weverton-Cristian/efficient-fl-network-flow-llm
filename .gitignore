@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local settings
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Datasets: keep documentation, never traffic records or derived shards
+data/*
+!data/README.md
+*.csv
+*.csv.gz
+*.arrow
+
+# Models, adapters and experiment outputs
+results/
+checkpoints/
+fl-results/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Logs and local caches
+*.log
+logs/
+.cache/
+.matplotlib/
+wandb/
+mlruns/
+
+# Notebook-generated state
+.ipynb_checkpoints/

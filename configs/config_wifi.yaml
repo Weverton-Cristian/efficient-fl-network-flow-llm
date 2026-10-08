@@ -1,0 +1,116 @@
+# Baseline derivada do experimento do artigo. Para novos testes, copie este
+# arquivo, altere simulation_name e mantenha a baseline intacta.
+simulation_name: "WiFi_CICIDS2018_Tuesday_balanced_seqcls_1152k_12r_200s"
+
+dataset_name: "wifi"
+description: "Balanced WiFi/network-flow classification using CIC-IDS2018 Tuesday flows with supervised federated sequence classification."
+
+data_base_path: "./data/"
+results_path: "./results/"
+
+# Raw dataset placement:
+#   data/wifi/raw/Thuesday-20-02-2018_TrafficForML_CICFlowMeter.csv
+raw_csv_file: "Thuesday-20-02-2018_TrafficForML_CICFlowMeter.csv"
+label_column: "Label"
+normal_label_values: ["Benign"]
+
+# Flow-to-text conversion:
+# The processor will use whichever of these columns are actually present in the CSV.
+wifi_content_columns:
+  - "Protocol"
+  - "Flow Duration"
+  - "Tot Fwd Pkts"
+  - "Tot Bwd Pkts"
+  - "TotLen Fwd Pkts"
+  - "TotLen Bwd Pkts"
+  - "Flow Byts/s"
+  - "Flow Bytes/s"
+  - "Flow Pkts/s"
+  - "Flow IAT Mean"
+  - "Fwd IAT Mean"
+  - "Bwd IAT Mean"
+  - "Pkt Len Mean"
+  - "Pkt Len Var"
+  - "SYN Flag Cnt"
+  - "ACK Flag Cnt"
+  - "PSH Flag Cnt"
+
+# Training / task strategy:
+training_task: "sequence_classification"
+num_labels: 2
+anomaly_label_id: 1
+
+# Split strategy:
+# - Match the benign class to the minority anomalous class.
+# - Split each class 80/20 into train/test.
+# - Keep extra benign rows for operational threshold calibration.
+wifi_split_strategy: "balanced_binary"
+balanced_anchor: "minority"
+balanced_class_cap: null
+train_fraction_per_class: 0.8
+random_seed: 42
+test_balance: false
+
+# Controlled-run controls:
+# With CICIDS2018 Tuesday currently available in this project:
+# - anomaly rows: 576,191
+# - matched benign rows: 576,191
+# - total balanced core: 1,152,382
+# - 80% train per class: 460,952 benign + 460,952 anomaly = 921,904
+# - 20% test per class: 115,239 benign + 115,239 anomaly = 230,478
+# Additional operational calibration split:
+# - 35k benign rows reserved from the benign surplus only
+raw_nrows: null
+calibration_benign_cap: 35000
+
+model_name: "HuggingFaceTB/SmolLM-135M"
+
+lora: true
+lora_rank: 8
+lora_alpha_multiplier: 2
+lora_dropout: 0.05
+
+use_parallel_training: true
+max_parallel_gpus: 2
+
+num_rounds: 12
+num_clients: 50
+client_frac: 0.2
+client_selection_strategy: "uniform"
+data_distribution_strategy: "iid"
+
+# Training policy for the balanced supervised experiment:
+# - 12 rounds keeps the run in the empirically stable region observed so far.
+# - 200 local steps gives each selected client a meaningfully stronger local update
+#   without forcing full local epochs over large shards.
+max_steps: 200
+num_train_epochs: 1
+logging_steps: 500
+batch_size: 2
+dataloader_num_workers: 6
+dataloader_pin_memory: true
+dataloader_persistent_workers: true
+initial_lr: 0.001
+lr_scheduler_type: "constant"
+warmup_steps: 0
+train_torch_dtype: "float16"
+train_mixed_precision: "fp16"
+
+# Reuse the already generated balanced splits/tokenized dataset for the final run.
+# This avoids unnecessary regeneration while preserving the exact same data setup.
+force_reprocess_data: false
+evaluator_version: "new"
+accuracy_method: "shifted"
+eval_batch_size: 8
+# Evaluate in FP32 to avoid threshold collapse from fp16 score quantization.
+eval_use_autocast: false
+eval_torch_dtype: "float32"
+calibration_source: "calibration_benign"
+calibration_num_samples: 35000
+hf_offline: true
+hf_local_files_only: true
+
+top_k_values: [1]
+threshold_selection: "fpr_target"
+fpr_target: 0.10
+f1_threshold_steps: 101

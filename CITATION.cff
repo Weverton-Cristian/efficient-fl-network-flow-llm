@@ -1,0 +1,52 @@
+cff-version: 1.2.0
+message: "If you use this software, cite this repository and the LANC 2026 paper listed as the preferred citation."
+title: "Efficient FL Network-Flow LLM"
+type: software
+authors:
+  - family-names: Cardoso
+    given-names: Tiago
+    email: tiago.cardoso@itec.ufpa.br
+    affiliation: "Federal University of Para"
+  - family-names: Duarte
+    given-names: Weverton
+    email: weverton.duartet@icen.ufpa.br
+    affiliation: "Federal University of Para"
+  - family-names: Costa
+    given-names: Allan Douglas
+    email: allan.costa@ufra.edu.br
+    affiliation: "Federal Rural University of the Amazon"
+  - family-names: Cerqueira
+    given-names: Eduardo
+    email: cerqueira@ufpa.br
+    affiliation: "Federal University of Para"
+repository-code: "https://github.com/Weverton-Cristian/efficient-fl-network-flow-llm"
+url: "https://github.com/Weverton-Cristian/efficient-fl-network-flow-llm"
+license: MIT
+preferred-citation:
+  type: conference-paper
+  title: "Lightweight Anomaly Detection in Enterprise Wi-Fi Networks Using LoRA-Adapted Small Language Models"
+  authors:
+    - family-names: Cardoso
+      given-names: Tiago
+      email: tiago.cardoso@itec.ufpa.br
+      affiliation: "Federal University of Para"
+    - family-names: Duarte
+      given-names: Weverton
+      email: weverton.duartet@icen.ufpa.br
+      affiliation: "Federal University of Para"
+    - family-names: Costa
+      given-names: Allan Douglas
+      email: allan.costa@ufra.edu.br
+      affiliation: "Federal Rural University of the Amazon"
+    - family-names: Cerqueira
+      given-names: Eduardo
+      email: cerqueira@ufpa.br
+      affiliation: "Federal University of Para"
+  collection-title: "2026 Latin America Networking Conference (LANC 2026)"
+  conference: "2026 Latin America Networking Conference (LANC 2026)"
+  publisher: "ACM"
+  location: "Mexico City, Mexico"
+  year: 2026
+  date-published: "2026-09-10"
+  url: "https://github.com/Weverton-Cristian/FL_NETWORK_FLOW_LLM"
+  notes: "To appear."
