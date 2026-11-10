@@ -8,3 +8,5 @@ scikit-learn
 pyyaml
 accelerate
 numpy
+psutil
+nvidia-ml-py

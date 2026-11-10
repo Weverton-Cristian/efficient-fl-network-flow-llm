@@ -24,12 +24,12 @@ O roadmap deste novo projeto inclui:
 - QLoRA e quantização INT8/INT4;
 - compressão de atualizações federadas;
 - redução do consumo de RAM e VRAM;
-- telemetria de tempo, memória, utilização e energia;
+- telemetria de tempo, memória, utilização e energia (implementada);
 - testes rápidos e perfis reprodutíveis;
 - melhorias de arquitetura e qualidade do código.
 
-QLoRA e a nova telemetria ainda não fazem parte deste primeiro snapshot. A
-configuração atual é a baseline LoRA preservada para permitir comparações
+QLoRA ainda não faz parte desta etapa. A telemetria foi adicionada como recurso
+opcional, mantendo a configuração LoRA original preservada para comparações
 controladas.
 
 ## Conteúdo deliberadamente excluído
@@ -48,8 +48,9 @@ Não são versionados:
 ## Estrutura
 
 ```text
-configs/config_wifi.yaml        configuração baseline WiFi
-data/README.md                  obtenção e posicionamento dos dados
+configs/config_wifi.yaml            configuração baseline WiFi
+configs/config_wifi_telemetry.yaml  baseline LoRA com telemetria habilitada
+data/README.md                       obtenção e posicionamento dos dados
 scripts/fetch_cicids2018_tuesday.sh
 scripts/evaluate_existing_experiment.py
 src/data_processing/            processamento WiFi
@@ -103,6 +104,36 @@ Depois que os artefatos locais forem criados:
 ```bash
 python main.py --config configs/config_wifi.yaml
 ```
+
+## Telemetria de treinamento
+
+A telemetria é opcional e fica desabilitada quando as chaves não estão
+presentes. Para executar a mesma política LoRA com coleta de recursos:
+
+```bash
+python main.py --config configs/config_wifi_telemetry.yaml
+```
+
+Os arquivos são atualizados de forma atômica durante o treinamento em
+`results/<simulation_name>/`:
+
+- `client_resource_metrics.csv`: tempos do cliente, CPU/RAM do processo e da
+  árvore de subprocessos, VRAM, utilização, potência e energia quando
+  disponíveis;
+- `round_resource_metrics.csv`: duração da fase de clientes, agregação,
+  checkpoint, status e totais de sucesso/falha por rodada;
+- `training_resource_summary.json`: resumo acumulado da execução.
+
+`psutil` fornece CPU/RAM e `nvidia-ml-py` fornece métricas NVML da GPU. Em modo
+`telemetry_strict: false`, coletores indisponíveis são registrados no campo
+`telemetry_errors` sem interromper o treinamento. O monitor é criado dentro de
+cada processo de cliente, enquanto somente o servidor grava os arquivos.
+
+As métricas `cuda_memory_*` pertencem ao alocador CUDA do processo do cliente.
+Já `gpu_memory_used_*`, utilização, potência e energia vêm do NVML e representam
+a GPU inteira; em uma GPU compartilhada, também podem incluir outras cargas.
+O monitor associa o índice CUDA lógico à GPU NVML por UUID ou pelo mapeamento de
+`CUDA_VISIBLE_DEVICES`, registrando a origem dessa associação no CSV.
 
 ## Princípio de reprodutibilidade
 

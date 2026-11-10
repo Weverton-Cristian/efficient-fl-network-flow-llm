@@ -4,12 +4,19 @@ import math
 import json
 import csv
 import time
+import traceback
 import torch
 import numpy as np
 from datasets import load_from_disk
 import concurrent.futures
 
 from src.models.model_loader import initialize_global_model
+from src.monitoring import (
+    ClientTrainingResult,
+    ResourceMonitor,
+    TelemetryMetricsWriter,
+    partition_client_results,
+)
 from .client import ClientTrainer
 
 
@@ -50,10 +57,93 @@ def train_client_process(args):
         torch.cuda.set_device(gpu_id)
 
     print(f"Iniciando treinamento para o cliente {client_id} na GPU {gpu_id}")
-    # Passa o gpu_id para o ClientTrainer
-    client_trainer = ClientTrainer(client_id, config, gpu_id)
-    cpu_weights = client_trainer.train(round_num, learning_rate)
-    return cpu_weights
+    return execute_client_training(
+        client_id,
+        config,
+        round_num,
+        learning_rate,
+        gpu_id=gpu_id,
+    )
+
+
+def execute_client_training(
+    client_id,
+    config,
+    round_num,
+    learning_rate,
+    *,
+    gpu_id=None,
+):
+    """Run one client attempt and always return a serializable result.
+
+    Resource sampling lives inside the worker process so it observes the local
+    model load and training allocations.  File persistence remains exclusively
+    in the server process.
+    """
+
+    monitor = None
+    monitor_started = False
+    client_trainer = None
+    weights = None
+    status = "failed"
+    error = None
+    resource_metrics = {}
+
+    try:
+        monitor = ResourceMonitor(config, gpu_id=gpu_id)
+        monitor.start()
+        monitor_started = True
+        client_config = dict(config)
+        client_config["telemetry_enabled"] = monitor.enabled
+        client_config["telemetry_synchronize_cuda"] = monitor.synchronize_cuda
+        client_trainer = ClientTrainer(client_id, client_config, gpu_id or 0)
+        weights = client_trainer.train(round_num, learning_rate)
+        if weights:
+            status = "success"
+        else:
+            status = "skipped"
+            weights = None
+    except Exception as exc:
+        error = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        weights = None
+    finally:
+        if monitor_started and monitor is not None:
+            try:
+                resource_metrics = monitor.stop()
+            except Exception as exc:
+                resource_metrics = monitor.metrics or {}
+                if error is None:
+                    error = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                    status = "failed"
+                    weights = None
+
+    # Raw samples are intentionally not transferred through multiprocessing in
+    # this first version; only their aggregate count is persisted.
+    resource_metrics.pop("raw_samples", None)
+    training_metrics = (
+        dict(client_trainer.last_training_metrics)
+        if client_trainer is not None
+        else {}
+    )
+    training_metrics.update(resource_metrics)
+
+    return ClientTrainingResult(
+        round_num=int(round_num),
+        client_id=int(client_id),
+        gpu_id=gpu_id,
+        status=status,
+        weights=weights,
+        metrics=training_metrics,
+        error=error,
+    )
 
 
 class FederatedServer:
@@ -74,6 +164,135 @@ class FederatedServer:
 
         # Métricas de custo de comunicação por rodada (tamanho dos updates)
         self.communication_metrics = []
+
+        # Optional training telemetry. Disabled by default for backward compatibility.
+        # Reuse the monitor's strict boolean parser so CLI/string values have
+        # the same meaning in the parent process and in every client worker.
+        self.telemetry_enabled = ResourceMonitor(config).enabled
+        self.client_resource_metrics = []
+        self.round_resource_metrics = []
+        self.telemetry_writer = TelemetryMetricsWriter(
+            os.path.join(config["results_path"], config["simulation_name"])
+        )
+
+    def _record_client_result(self, result, *, batch_index):
+        if not self.telemetry_enabled:
+            return
+        row = result.metric_row()
+        row["batch_index"] = int(batch_index)
+        row["update_bytes"] = self._weights_size_bytes(result.weights)
+        row["update_params"] = self._weights_num_params(result.weights)
+        self.client_resource_metrics.append(row)
+        self._persist_telemetry()
+
+    def _record_round_resources(
+        self,
+        *,
+        round_num,
+        mode,
+        learning_rate,
+        selected_client_ids,
+        client_results,
+        client_phase_seconds,
+        aggregation_seconds,
+        checkpoint_seconds,
+        round_duration_seconds,
+        status="completed",
+        failure_phase=None,
+        error_type=None,
+        error_message=None,
+    ):
+        if not self.telemetry_enabled:
+            return
+        if status not in {"completed", "aborted", "failed"}:
+            raise ValueError(f"Invalid round telemetry status: {status!r}")
+        successful_ids = [
+            result.client_id for result in client_results if result.status == "success"
+        ]
+        failed_ids = [
+            result.client_id for result in client_results if result.status == "failed"
+        ]
+        skipped_ids = [
+            result.client_id for result in client_results if result.status == "skipped"
+        ]
+        self.round_resource_metrics.append(
+            {
+                "round": int(round_num),
+                "mode": mode,
+                "status": status,
+                "failure_phase": failure_phase,
+                "error_type": error_type,
+                "error_message": error_message,
+                "learning_rate": float(learning_rate),
+                "selected_clients": len(selected_client_ids),
+                "successful_clients": len(successful_ids),
+                "failed_clients": len(failed_ids),
+                "skipped_clients": len(skipped_ids),
+                "selected_client_ids": selected_client_ids,
+                "successful_client_ids": successful_ids,
+                "failed_client_ids": failed_ids,
+                "skipped_client_ids": skipped_ids,
+                "client_phase_seconds": float(client_phase_seconds),
+                "aggregation_seconds": float(aggregation_seconds),
+                "checkpoint_seconds": float(checkpoint_seconds),
+                "round_duration_seconds": float(round_duration_seconds),
+            }
+        )
+        self._persist_telemetry()
+
+    def _persist_telemetry(self):
+        if not self.telemetry_enabled:
+            return
+        self.telemetry_writer.write_clients(self.client_resource_metrics)
+        self.telemetry_writer.write_rounds(self.round_resource_metrics)
+
+        energy_values = [
+            row.get("gpu_energy_joules")
+            for row in self.client_resource_metrics
+            if isinstance(row.get("gpu_energy_joules"), (int, float))
+        ]
+        peak_vram_values = [
+            row.get("cuda_memory_reserved_peak_bytes")
+            for row in self.client_resource_metrics
+            if isinstance(row.get("cuda_memory_reserved_peak_bytes"), (int, float))
+        ]
+        self.telemetry_writer.write_summary(
+            {
+                "telemetry_enabled": True,
+                "client_attempts": len(self.client_resource_metrics),
+                "successful_clients": sum(
+                    row.get("status") == "success"
+                    for row in self.client_resource_metrics
+                ),
+                "failed_clients": sum(
+                    row.get("status") == "failed"
+                    for row in self.client_resource_metrics
+                ),
+                "skipped_clients": sum(
+                    row.get("status") == "skipped"
+                    for row in self.client_resource_metrics
+                ),
+                "recorded_rounds": len(self.round_resource_metrics),
+                "completed_rounds": sum(
+                    row.get("status") == "completed"
+                    for row in self.round_resource_metrics
+                ),
+                "aborted_rounds": sum(
+                    row.get("status") == "aborted"
+                    for row in self.round_resource_metrics
+                ),
+                "failed_rounds": sum(
+                    row.get("status") == "failed"
+                    for row in self.round_resource_metrics
+                ),
+                "client_gpu_energy_joules_sum": sum(energy_values)
+                if energy_values
+                else None,
+                "client_cuda_reserved_peak_bytes_max": max(peak_vram_values)
+                if peak_vram_values
+                else None,
+            }
+        )
 
     def _weights_size_bytes(self, weights_dict):
         """Returns total serialized size in bytes for a state_dict-like object."""
@@ -437,6 +656,23 @@ class FederatedServer:
             }
             self.global_model.load_state_dict(gpu_aggregated_weights)
 
+    @staticmethod
+    def _round_failure_message(
+        round_num,
+        selected_client_ids,
+        failure_messages=None,
+    ):
+        details = ""
+        if failure_messages:
+            preview = " | ".join(str(msg) for msg in failure_messages[:3])
+            details = f" Sample failures: {preview}"
+
+        return (
+            f"Round {round_num} aborted: no selected client produced a usable "
+            f"update ({selected_client_ids}). No aggregation was performed and "
+            f"continuing would produce invalid checkpoints.{details}"
+        )
+
     def _abort_if_round_failed(
         self,
         round_num,
@@ -447,15 +683,12 @@ class FederatedServer:
         if successful_client_ids:
             return
 
-        details = ""
-        if failure_messages:
-            preview = " | ".join(str(msg) for msg in failure_messages[:3])
-            details = f" Sample failures: {preview}"
-
         raise RuntimeError(
-            f"Round {round_num} aborted: all selected clients failed "
-            f"({selected_client_ids}). No aggregation was performed and continuing "
-            f"would produce invalid checkpoints.{details}"
+            self._round_failure_message(
+                round_num,
+                selected_client_ids,
+                failure_messages,
+            )
         )
 
     def _select_clients_for_round(self, round_num):
@@ -532,16 +765,17 @@ class FederatedServer:
             self._run_sequential_training()
 
         self._save_communication_metrics()
+        self._persist_telemetry()
 
     def _run_sequential_training(self):
         """Executes training sequentially in the main process."""
         print("--- Running in Sequential Mode ---")
         total_rounds = self.config["num_rounds"]
         round_times = []
-        training_start = time.time()
+        training_start = time.perf_counter()
 
         for round_num in range(1, total_rounds + 1):
-            round_start = time.time()
+            round_start = time.perf_counter()
 
             # ETA calculation
             if round_times:
@@ -557,57 +791,150 @@ class FederatedServer:
 
             selected_clients_ids = self._select_clients_for_round(round_num)
 
-            client_weights_list = []
-            successful_client_ids = []
-            failure_messages = []
             current_lr = self._get_learning_rate(round_num)
-            for client_id in selected_clients_ids:
-                client_trainer = ClientTrainer(client_id, self.config)
-                try:
-                    cpu_weights = client_trainer.train(round_num, current_lr)
-                    if cpu_weights:
-                        client_weights_list.append(cpu_weights)
-                        successful_client_ids.append(client_id)
-                except Exception as e:
-                    msg = f"client_{client_id}: {e}"
-                    failure_messages.append(msg)
-                    print(f"Erro ao treinar cliente: {msg}")
+            client_results = []
+            client_phase_start = time.perf_counter()
+            gpu_id = torch.cuda.current_device() if torch.cuda.is_available() else None
+
+            for batch_index, client_id in enumerate(selected_clients_ids, start=1):
+                result = execute_client_training(
+                    client_id,
+                    self.config,
+                    round_num,
+                    current_lr,
+                    gpu_id=gpu_id,
+                )
+                client_results.append(result)
+                self._record_client_result(result, batch_index=batch_index)
+                if result.status == "failed":
+                    message = (result.error or {}).get("message", "unknown error")
+                    print(f"Erro ao treinar cliente: client_{client_id}: {message}")
+
+            client_phase_seconds = time.perf_counter() - client_phase_start
+            partitioned = partition_client_results(client_results)
+
+            if not partitioned.successful_client_ids:
+                round_elapsed = time.perf_counter() - round_start
+                self._record_round_resources(
+                    round_num=round_num,
+                    mode="sequential",
+                    learning_rate=current_lr,
+                    selected_client_ids=selected_clients_ids,
+                    client_results=client_results,
+                    client_phase_seconds=client_phase_seconds,
+                    aggregation_seconds=0.0,
+                    checkpoint_seconds=0.0,
+                    round_duration_seconds=round_elapsed,
+                    status="aborted",
+                    failure_phase="client_training",
+                    error_type="RuntimeError",
+                    error_message=self._round_failure_message(
+                        round_num,
+                        selected_clients_ids,
+                        partitioned.failure_messages,
+                    ),
+                )
 
             self._abort_if_round_failed(
                 round_num,
                 selected_clients_ids,
-                successful_client_ids,
-                failure_messages,
+                partitioned.successful_client_ids,
+                partitioned.failure_messages,
             )
 
             print("Aggregating client models...")
-            self._aggregate_models(client_weights_list, successful_client_ids)
+            aggregation_start = time.perf_counter()
+            try:
+                self._aggregate_models(
+                    partitioned.client_weights,
+                    partitioned.successful_client_ids,
+                )
+            except Exception as exc:
+                aggregation_seconds = time.perf_counter() - aggregation_start
+                self._record_round_resources(
+                    round_num=round_num,
+                    mode="sequential",
+                    learning_rate=current_lr,
+                    selected_client_ids=selected_clients_ids,
+                    client_results=client_results,
+                    client_phase_seconds=client_phase_seconds,
+                    aggregation_seconds=aggregation_seconds,
+                    checkpoint_seconds=0.0,
+                    round_duration_seconds=time.perf_counter() - round_start,
+                    status="failed",
+                    failure_phase="aggregation",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                raise
+            aggregation_seconds = time.perf_counter() - aggregation_start
 
-            # Communication metrics (bytes communicated this round)
-            self._record_round_communication(
-                round_num, successful_client_ids, client_weights_list
-            )
+            checkpoint_start = None
+            failure_phase = "communication_metrics"
+            try:
+                # Communication metrics (bytes communicated this round)
+                self._record_round_communication(
+                    round_num,
+                    partitioned.successful_client_ids,
+                    partitioned.client_weights,
+                )
 
-            round_model_path = os.path.join(
-                self.config["results_path"],
-                self.config["simulation_name"],
-                f"round_{round_num}",
-                "global_model",
-            )
-            os.makedirs(round_model_path, exist_ok=True)
-            self.global_model.save_pretrained(round_model_path)
+                failure_phase = "checkpoint"
+                checkpoint_start = time.perf_counter()
+                round_model_path = os.path.join(
+                    self.config["results_path"],
+                    self.config["simulation_name"],
+                    f"round_{round_num}",
+                    "global_model",
+                )
+                os.makedirs(round_model_path, exist_ok=True)
+                self.global_model.save_pretrained(round_model_path)
+            except Exception as exc:
+                checkpoint_seconds = (
+                    time.perf_counter() - checkpoint_start
+                    if checkpoint_start is not None
+                    else 0.0
+                )
+                self._record_round_resources(
+                    round_num=round_num,
+                    mode="sequential",
+                    learning_rate=current_lr,
+                    selected_client_ids=selected_clients_ids,
+                    client_results=client_results,
+                    client_phase_seconds=client_phase_seconds,
+                    aggregation_seconds=aggregation_seconds,
+                    checkpoint_seconds=checkpoint_seconds,
+                    round_duration_seconds=time.perf_counter() - round_start,
+                    status="failed",
+                    failure_phase=failure_phase,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                raise
+            checkpoint_seconds = time.perf_counter() - checkpoint_start
 
             # Time tracking
-            round_elapsed = time.time() - round_start
+            round_elapsed = time.perf_counter() - round_start
             round_times.append(round_elapsed)
-            total_elapsed = time.time() - training_start
+            total_elapsed = time.perf_counter() - training_start
+            self._record_round_resources(
+                round_num=round_num,
+                mode="sequential",
+                learning_rate=current_lr,
+                selected_client_ids=selected_clients_ids,
+                client_results=client_results,
+                client_phase_seconds=client_phase_seconds,
+                aggregation_seconds=aggregation_seconds,
+                checkpoint_seconds=checkpoint_seconds,
+                round_duration_seconds=round_elapsed,
+            )
 
             print(
                 f"Round {round_num} completed in {format_time(round_elapsed)} | Total: {format_time(total_elapsed)}"
             )
 
         # Final summary
-        total_time = time.time() - training_start
+        total_time = time.perf_counter() - training_start
         print(f"\n{'=' * 60}")
         print(f"  TRAINING COMPLETE")
         print(f"  Total time: {format_time(total_time)}")
@@ -633,10 +960,10 @@ class FederatedServer:
 
         total_rounds = self.config["num_rounds"]
         round_times = []
-        training_start = time.time()
+        training_start = time.perf_counter()
 
         for round_num in range(1, total_rounds + 1):
-            round_start = time.time()
+            round_start = time.perf_counter()
 
             # ETA calculation
             if round_times:
@@ -652,10 +979,9 @@ class FederatedServer:
 
             selected_clients_ids = self._select_clients_for_round(round_num)
 
-            client_weights_list = []
-            successful_client_ids = []
-            failure_messages = []
+            client_results = []
             current_lr = self._get_learning_rate(round_num)
+            client_phase_start = time.perf_counter()
 
             # Mover o modelo global para a CPU para liberar VRAM para os clientes
             self.global_model.to("cpu")
@@ -672,58 +998,189 @@ class FederatedServer:
                         gpu_id = j % num_gpus
                         args = (client_id, self.config, round_num, current_lr, gpu_id)
                         future = executor.submit(train_client_process, args)
-                        future_to_client[future] = client_id
+                        future_to_client[future] = (client_id, gpu_id, i + 1)
 
                     for future in concurrent.futures.as_completed(future_to_client):
-                        client_id = future_to_client[future]
+                        client_id, gpu_id, batch_index = future_to_client[future]
                         try:
-                            cpu_weights = future.result()
-                            if cpu_weights:
-                                client_weights_list.append(cpu_weights)
-                                successful_client_ids.append(client_id)
-                        except Exception as e:
-                            msg = f"client_{client_id}: {e}"
-                            failure_messages.append(msg)
-                            print(f"Erro ao treinar cliente: {msg}")
+                            result = future.result()
+                            if not isinstance(result, ClientTrainingResult):
+                                raise TypeError(
+                                    "client worker returned an invalid result type: "
+                                    f"{type(result).__name__}"
+                                )
+                        except Exception as exc:
+                            result = ClientTrainingResult(
+                                round_num=int(round_num),
+                                client_id=int(client_id),
+                                gpu_id=int(gpu_id),
+                                status="failed",
+                                error={
+                                    "type": type(exc).__name__,
+                                    "message": str(exc),
+                                    "traceback": traceback.format_exc(),
+                                },
+                            )
+
+                        client_results.append(result)
+                        self._record_client_result(
+                            result,
+                            batch_index=batch_index,
+                        )
+                        if result.status == "failed":
+                            message = (result.error or {}).get(
+                                "message", "unknown error"
+                            )
+                            print(
+                                f"Erro ao treinar cliente: client_{client_id}: {message}"
+                            )
 
             # Mover o modelo de volta para a GPU para agregação
-            self.global_model.to(self.device)
+            try:
+                self.global_model.to(self.device)
+            except Exception as exc:
+                client_phase_seconds = time.perf_counter() - client_phase_start
+                self._record_round_resources(
+                    round_num=round_num,
+                    mode="parallel",
+                    learning_rate=current_lr,
+                    selected_client_ids=selected_clients_ids,
+                    client_results=client_results,
+                    client_phase_seconds=client_phase_seconds,
+                    aggregation_seconds=0.0,
+                    checkpoint_seconds=0.0,
+                    round_duration_seconds=time.perf_counter() - round_start,
+                    status="failed",
+                    failure_phase="model_restore",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                raise
+            client_phase_seconds = time.perf_counter() - client_phase_start
+            partitioned = partition_client_results(client_results)
+
+            if not partitioned.successful_client_ids:
+                round_elapsed = time.perf_counter() - round_start
+                self._record_round_resources(
+                    round_num=round_num,
+                    mode="parallel",
+                    learning_rate=current_lr,
+                    selected_client_ids=selected_clients_ids,
+                    client_results=client_results,
+                    client_phase_seconds=client_phase_seconds,
+                    aggregation_seconds=0.0,
+                    checkpoint_seconds=0.0,
+                    round_duration_seconds=round_elapsed,
+                    status="aborted",
+                    failure_phase="client_training",
+                    error_type="RuntimeError",
+                    error_message=self._round_failure_message(
+                        round_num,
+                        selected_clients_ids,
+                        partitioned.failure_messages,
+                    ),
+                )
 
             self._abort_if_round_failed(
                 round_num,
                 selected_clients_ids,
-                successful_client_ids,
-                failure_messages,
+                partitioned.successful_client_ids,
+                partitioned.failure_messages,
             )
 
             print("Aggregating client models...")
-            self._aggregate_models(client_weights_list, successful_client_ids)
+            aggregation_start = time.perf_counter()
+            try:
+                self._aggregate_models(
+                    partitioned.client_weights,
+                    partitioned.successful_client_ids,
+                )
+            except Exception as exc:
+                aggregation_seconds = time.perf_counter() - aggregation_start
+                self._record_round_resources(
+                    round_num=round_num,
+                    mode="parallel",
+                    learning_rate=current_lr,
+                    selected_client_ids=selected_clients_ids,
+                    client_results=client_results,
+                    client_phase_seconds=client_phase_seconds,
+                    aggregation_seconds=aggregation_seconds,
+                    checkpoint_seconds=0.0,
+                    round_duration_seconds=time.perf_counter() - round_start,
+                    status="failed",
+                    failure_phase="aggregation",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                raise
+            aggregation_seconds = time.perf_counter() - aggregation_start
 
-            # Communication metrics (bytes communicated this round)
-            self._record_round_communication(
-                round_num, successful_client_ids, client_weights_list
-            )
+            checkpoint_start = None
+            failure_phase = "communication_metrics"
+            try:
+                # Communication metrics (bytes communicated this round)
+                self._record_round_communication(
+                    round_num,
+                    partitioned.successful_client_ids,
+                    partitioned.client_weights,
+                )
 
-            round_model_path = os.path.join(
-                self.config["results_path"],
-                self.config["simulation_name"],
-                f"round_{round_num}",
-                "global_model",
-            )
-            os.makedirs(round_model_path, exist_ok=True)
-            self.global_model.save_pretrained(round_model_path)
+                failure_phase = "checkpoint"
+                checkpoint_start = time.perf_counter()
+                round_model_path = os.path.join(
+                    self.config["results_path"],
+                    self.config["simulation_name"],
+                    f"round_{round_num}",
+                    "global_model",
+                )
+                os.makedirs(round_model_path, exist_ok=True)
+                self.global_model.save_pretrained(round_model_path)
+            except Exception as exc:
+                checkpoint_seconds = (
+                    time.perf_counter() - checkpoint_start
+                    if checkpoint_start is not None
+                    else 0.0
+                )
+                self._record_round_resources(
+                    round_num=round_num,
+                    mode="parallel",
+                    learning_rate=current_lr,
+                    selected_client_ids=selected_clients_ids,
+                    client_results=client_results,
+                    client_phase_seconds=client_phase_seconds,
+                    aggregation_seconds=aggregation_seconds,
+                    checkpoint_seconds=checkpoint_seconds,
+                    round_duration_seconds=time.perf_counter() - round_start,
+                    status="failed",
+                    failure_phase=failure_phase,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                raise
+            checkpoint_seconds = time.perf_counter() - checkpoint_start
 
             # Time tracking
-            round_elapsed = time.time() - round_start
+            round_elapsed = time.perf_counter() - round_start
             round_times.append(round_elapsed)
-            total_elapsed = time.time() - training_start
+            total_elapsed = time.perf_counter() - training_start
+            self._record_round_resources(
+                round_num=round_num,
+                mode="parallel",
+                learning_rate=current_lr,
+                selected_client_ids=selected_clients_ids,
+                client_results=client_results,
+                client_phase_seconds=client_phase_seconds,
+                aggregation_seconds=aggregation_seconds,
+                checkpoint_seconds=checkpoint_seconds,
+                round_duration_seconds=round_elapsed,
+            )
 
             print(
                 f"Round {round_num} completed in {format_time(round_elapsed)} | Total: {format_time(total_elapsed)}"
             )
 
         # Final summary
-        total_time = time.time() - training_start
+        total_time = time.perf_counter() - training_start
         print(f"\n{'=' * 60}")
         print(f"  TRAINING COMPLETE")
         print(f"  Total time: {format_time(total_time)}")

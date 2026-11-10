@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from collections import Counter
 from dataclasses import dataclass
 import inspect
@@ -102,6 +103,16 @@ class ClientTrainer:
         self.training_task = str(
             config.get("training_task", "causal_lm")
         ).strip().lower()
+        self.last_training_metrics = {}
+
+    def _telemetry_synchronize_cuda(self):
+        """Synchronize timing boundaries only when telemetry requests it."""
+        if not self.config.get("telemetry_enabled", False):
+            return
+        if not self.config.get("telemetry_synchronize_cuda", True):
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.gpu_id)
 
     def _resolve_train_model_dtype(self):
         dtype_name = str(self.config.get("train_torch_dtype", "auto")).strip().lower()
@@ -256,9 +267,20 @@ class ClientTrainer:
         print(
             f"--- Starting training for Client {self.client_id} in Round {round_num} ---"
         )
+        self.last_training_metrics = {
+            "learning_rate": float(learning_rate),
+        }
 
         # 1. Load model and dataset
-        model = self._load_model_for_training(round_num)
+        self._telemetry_synchronize_cuda()
+        model_load_started = time.perf_counter()
+        try:
+            model = self._load_model_for_training(round_num)
+        finally:
+            self._telemetry_synchronize_cuda()
+            self.last_training_metrics["model_load_seconds"] = (
+                time.perf_counter() - model_load_started
+            )
         if bool(self.config.get("legacy_flresults_layout", False)):
             client_dataset_path = os.path.join(
                 self.config["results_path"],
@@ -273,9 +295,18 @@ class ClientTrainer:
                 "client_data",
                 f"client_{self.client_id}",
             )
-        client_dataset = load_from_disk(client_dataset_path)
+        dataset_load_started = time.perf_counter()
+        try:
+            client_dataset = load_from_disk(client_dataset_path)
+        finally:
+            self.last_training_metrics["dataset_load_seconds"] = (
+                time.perf_counter() - dataset_load_started
+            )
+        self.last_training_metrics["local_num_samples"] = len(client_dataset)
         if len(client_dataset) == 0:
             print(f"  Client {self.client_id}: No local samples. Skipping training.")
+            del model
+            torch.cuda.empty_cache()
             return None
         client_dataset = client_dataset.shuffle(seed=round_num)
 
@@ -292,6 +323,7 @@ class ClientTrainer:
             print(f"  FedProx enabled with mu={fedprox_mu}")
 
         # 3. Setup Training Arguments
+        trainer_setup_started = time.perf_counter()
         legacy_training_args = bool(self.config.get("legacy_training_args", False))
         ta_params = set(inspect.signature(TrainingArguments.__init__).parameters)
         dataloader_num_workers = int(self.config.get("dataloader_num_workers", 0))
@@ -524,22 +556,63 @@ class ClientTrainer:
                 trainer = Trainer(**trainer_kwargs)
 
         # 5. Run Training
-        trainer.train()
+        self._telemetry_synchronize_cuda()
+        trainer_train_started = time.perf_counter()
+        self.last_training_metrics["trainer_setup_seconds"] = (
+            trainer_train_started - trainer_setup_started
+        )
+        try:
+            train_output = trainer.train()
+        finally:
+            self._telemetry_synchronize_cuda()
+            self.last_training_metrics["trainer_train_seconds"] = (
+                time.perf_counter() - trainer_train_started
+            )
+        train_metrics = dict(getattr(train_output, "metrics", {}) or {})
+        self.last_training_metrics.update(
+            {
+                "global_step": int(getattr(train_output, "global_step", 0)),
+                "training_loss": float(getattr(train_output, "training_loss", 0.0)),
+                "train_runtime_seconds": train_metrics.get("train_runtime"),
+                "train_samples_per_second": train_metrics.get(
+                    "train_samples_per_second"
+                ),
+                "train_steps_per_second": train_metrics.get(
+                    "train_steps_per_second"
+                ),
+                "total_flos": train_metrics.get(
+                    "total_flos", getattr(trainer.state, "total_flos", None)
+                ),
+                "epoch": train_metrics.get(
+                    "epoch", getattr(trainer.state, "epoch", None)
+                ),
+                "trainer_fp16": bool(use_fp16),
+                "trainer_bf16": bool(use_bf16),
+            }
+        )
         print(f"--- Client {self.client_id} training complete. ---")
 
         # 5. Extract LoRA adapters to CPU and return them
         # This prevents VRAM overflow on the server by not returning the whole model.
-        if self.use_lora:
-            cpu_adapters = {
-                name: param.detach().to("cpu").clone()
-                for name, param in model.named_parameters()
-                if param.requires_grad
-            }
-        else:
-            # For full fine-tuning, return the entire state dict on CPU
-            cpu_adapters = {
-                name: param.to("cpu") for name, param in model.state_dict().items()
-            }
+        self._telemetry_synchronize_cuda()
+        extraction_started = time.perf_counter()
+        try:
+            if self.use_lora:
+                cpu_adapters = {
+                    name: param.detach().to("cpu").clone()
+                    for name, param in model.named_parameters()
+                    if param.requires_grad
+                }
+            else:
+                # For full fine-tuning, return the entire state dict on CPU
+                cpu_adapters = {
+                    name: param.to("cpu") for name, param in model.state_dict().items()
+                }
+        finally:
+            self._telemetry_synchronize_cuda()
+            self.last_training_metrics["adapter_extraction_seconds"] = (
+                time.perf_counter() - extraction_started
+            )
 
         # Explicitly free up VRAM
         del model
