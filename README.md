@@ -28,9 +28,8 @@ O roadmap deste novo projeto inclui:
 - testes rápidos e perfis reprodutíveis;
 - melhorias de arquitetura e qualidade do código.
 
-QLoRA ainda não faz parte desta etapa. A telemetria foi adicionada como recurso
-opcional, mantendo a configuração LoRA original preservada para comparações
-controladas.
+QLoRA ainda não faz parte desta etapa. A telemetria está habilitada no perfil
+controlado usado para as comparações.
 
 ## Conteúdo deliberadamente excluído
 
@@ -48,9 +47,8 @@ Não são versionados:
 ## Estrutura
 
 ```text
-configs/config_wifi.yaml            configuração baseline WiFi
-configs/config_wifi_telemetry.yaml  baseline LoRA com telemetria habilitada
-data/README.md                       obtenção e posicionamento dos dados
+configs/config_wifi.yaml        perfil controlado WiFi com telemetria
+data/README.md                  obtenção e posicionamento dos dados
 scripts/fetch_cicids2018_tuesday.sh
 scripts/evaluate_existing_experiment.py
 src/data_processing/            processamento WiFi
@@ -87,9 +85,9 @@ O arquivo será colocado em:
 data/wifi/raw/Thuesday-20-02-2018_TrafficForML_CICFlowMeter.csv
 ```
 
-## Execução da baseline
+## Execução do perfil controlado
 
-A configuração preservada assume que os dados processados e o modelo já estão
+A configuração atual assume que os dados processados e o modelo já estão
 disponíveis localmente. Para uma primeira execução com download e processamento:
 
 ```bash
@@ -107,11 +105,11 @@ python main.py --config configs/config_wifi.yaml
 
 ## Telemetria de treinamento
 
-A telemetria é opcional e fica desabilitada quando as chaves não estão
-presentes. Para executar a mesma política LoRA com coleta de recursos:
+A configuração principal habilita a telemetria e usa 5 rodadas, 10 clientes,
+seleção de 20% dos clientes por rodada e LoRA rank 4. A execução é direta:
 
 ```bash
-python main.py --config configs/config_wifi_telemetry.yaml
+python main.py --config configs/config_wifi.yaml
 ```
 
 Os arquivos são atualizados de forma atômica durante o treinamento em
@@ -124,8 +122,8 @@ Os arquivos são atualizados de forma atômica durante o treinamento em
   checkpoint, status e totais de sucesso/falha por rodada;
 - `training_resource_summary.json`: resumo acumulado da execução.
 
-`psutil` fornece CPU/RAM e `nvidia-ml-py` fornece métricas NVML da GPU. Em modo
-`telemetry_strict: false`, coletores indisponíveis são registrados no campo
+`psutil` fornece CPU/RAM e `nvidia-ml-py` fornece métricas NVML da GPU. No modo
+não estrito padrão, coletores indisponíveis são registrados no campo
 `telemetry_errors` sem interromper o treinamento. O monitor é criado dentro de
 cada processo de cliente, enquanto somente o servidor grava os arquivos.
 
@@ -137,10 +135,10 @@ O monitor associa o índice CUDA lógico à GPU NVML por UUID ou pelo mapeamento
 
 ## Princípio de reprodutibilidade
 
-A baseline do artigo não deve ser silenciosamente alterada. Novas experiências
-de QLoRA, quantização, compressão ou profiling deverão usar novos arquivos em
-`configs/`, nomes de simulação próprios e registrar versões de software e
-hardware.
+`configs/config_wifi.yaml` é a única configuração autoritativa do experimento.
+As comparações LoRA/QLoRA devem manter 5 rodadas, 10 clientes e a mesma fração
+de seleção, alterar o `simulation_name` quando necessário e registrar cada etapa
+em um commit.
 
 ## Licença e citação
 
